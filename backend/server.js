@@ -3,6 +3,7 @@ const dotenv = require("dotenv");
 const express = require("express");
 const mongoose = require("mongoose");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const Member = require("./models/Member");
 const membersRouter = require("./routes/members");
 
@@ -17,6 +18,53 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: "10kb" }));
 
+const adminId = process.env.ADMIN_ID || "admin";
+const adminPassword = process.env.ADMIN_PASSWORD || "admin";
+const sessions = new Map();
+
+function safeEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  return leftBuffer.length === rightBuffer.length
+    && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requireAdmin(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const token = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  if (!sessions.has(token)) {
+    return res.status(401).json({ error: "Admin login required." });
+  }
+
+  return next();
+}
+
+app.post("/api/auth/login", (req, res) => {
+  const id = req.body?.id;
+  const password = req.body?.password;
+
+  if (!safeEqual(id, adminId) || !safeEqual(password, adminPassword)) {
+    return res.status(401).json({ error: "Invalid admin ID or password." });
+  }
+
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, { id: adminId, createdAt: Date.now() });
+  return res.json({ token, admin: { id: adminId } });
+});
+
+app.post("/api/auth/logout", requireAdmin, (req, res) => {
+  const token = (req.get("authorization") || "").slice(7);
+  sessions.delete(token);
+  return res.status(204).end();
+});
+
+app.get("/api/auth/session", requireAdmin, (req, res) => {
+  res.json({ admin: { id: adminId } });
+});
+
 app.get("/", (req, res) => {
   res.json({ message: "GymPortal API is running." });
 });
@@ -29,7 +77,7 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-app.use("/api/members", membersRouter);
+app.use("/api/members", requireAdmin, membersRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found." });
@@ -82,11 +130,15 @@ async function startServer() {
     throw new Error("MONGO_URI is required. Set it in backend/.env.");
   }
 
-  await mongoose.connect(process.env.MONGO_URI);
-  await ensureMemberCollection();
-
   const port = Number(process.env.PORT) || 5000;
   const host = process.env.HOST || "127.0.0.1";
+
+  try {
+    await mongoose.connect(process.env.MONGO_URI);
+    await ensureMemberCollection();
+  } catch (error) {
+    console.warn(`MongoDB unavailable; member data will use temporary memory: ${error.message}`);
+  }
 
   return app.listen(port, host, () => {
     console.log(`GymPortal API listening on http://${host}:${port}`);
